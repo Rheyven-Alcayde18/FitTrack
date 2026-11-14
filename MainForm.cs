@@ -34,6 +34,10 @@ namespace FitTrack
         private Color ink = ColorTranslator.FromHtml("#173B3A");   // text on teal; never changes
         private Label themeButton;
 
+        // ACHIEVEMENTS
+        private readonly AchievementService _achievements = new AchievementService();
+        private ToolTip achTip = new ToolTip();
+
         // The content area is a fixed 400px wide and every page is designed to fit without page scrolling.
         private const int CW = 400;
 
@@ -63,8 +67,15 @@ namespace FitTrack
         // Navigation animation
         private System.Windows.Forms.Timer pageTimer;
         private Stopwatch clock = new Stopwatch();
-        private PictureBox oldPageSnapshot;
-        private PictureBox newPageSnapshot;
+        private SlideView slideView;          // one control that paints both pages during the slide
+
+        // Entrance animations (count-ups, growing bars, filling progress bars). Registered while a page is built,
+        // started once the page is actually visible (after the slide finishes).
+        private class Tween { public Action<float> Apply; public int Delay; public int Duration; }
+        private readonly List<Tween> tweens = new List<Tween>();
+        private System.Windows.Forms.Timer tweenTimer;
+        private Stopwatch tweenClock = new Stopwatch();
+        private bool buildingForSlide;
         private int slideDirection = 1;          // 1 = new page enters from the right, -1 = from the left
         private const int AnimationMs = 260;
         private bool isAnimating = false;
@@ -148,8 +159,13 @@ namespace FitTrack
             InitializeComponent();
 
             pageTimer = new System.Windows.Forms.Timer();
-            pageTimer.Interval = 15;
+            pageTimer.Interval = 10;   // Windows rounds this to ~15 ms, which is about 60 fps
             pageTimer.Tick += PageTimer_Tick;
+
+            tweenTimer = new System.Windows.Forms.Timer();
+            tweenTimer.Interval = 10;
+            tweenTimer.Tick += TweenTick;
+            Shown += delegate { StartPageAnimations(); };   // first page plays its entrance when the window opens
 
             BuildNavigation();
             this.Controls.Add(navBar);
@@ -158,11 +174,9 @@ namespace FitTrack
             navBar.BringToFront();
 
             ApplyMobileLayout();
+            RefreshAchievements(false);   // unlock silently for the workouts that already exist
             ShowDashboard();
-
-            Panel look = MakeCard(0, 516, CW, 64);
-            look.Controls.Add(MakeLabel("Appearance", 18, 20, 200, 24, 11, true, dark));
-            look.Controls.Add(MakeButton(darkMode ? "Light mode" : "Dark mode", CW - 134, 15, 116, 34, ToggleTheme, true));
+            // (The old "Appearance" card was removed: it covered the Home page. Use the moon/sun button in the top bar.)
         }
 
         // Dark mode button: flip the flag, recolor everything, rebuild the current page.
@@ -328,9 +342,53 @@ namespace FitTrack
         private void PreparePage(string title, string subtitle)
         {
             if (isAnimating) FinishAnimation();   // never clear controls while snapshots are on screen
+            ClearTweens();
             titleLabel.Text = title;
             subtitleLabel.Text = subtitle;
             mainContent.Controls.Clear();
+            // Pages built outside a slide (first load, theme switch, in-page refresh) play their entrance right away.
+            if (!buildingForSlide && IsHandleCreated) BeginInvoke(new Action(StartPageAnimations));
+        }
+
+        // ---------------- tiny tween engine ----------------
+        private void AddTween(int delay, int duration, Action<float> apply)
+        {
+            apply(0f);                                   // start from the "empty" state so the first frame is correct
+            Tween tw = new Tween();
+            tw.Apply = apply; tw.Delay = delay; tw.Duration = duration;
+            tweens.Add(tw);
+        }
+
+        private void AnimateProgress(SoftProgress bar, int target, int delay)
+        {
+            AddTween(delay, 700, v => bar.Value = (int)Math.Round(target * v));
+        }
+
+        private void StartPageAnimations()
+        {
+            if (tweens.Count == 0) return;
+            tweenClock.Restart();
+            tweenTimer.Start();
+        }
+
+        private void ClearTweens()
+        {
+            tweenTimer.Stop();
+            tweens.Clear();
+        }
+
+        private void TweenTick(object sender, EventArgs e)
+        {
+            long now = tweenClock.ElapsedMilliseconds;
+            for (int i = tweens.Count - 1; i >= 0; i--)
+            {
+                Tween tw = tweens[i];
+                float t = Math.Max(0f, Math.Min(1f, (now - tw.Delay) / (float)tw.Duration));
+                float eased = 1f - (float)Math.Pow(1f - t, 3);     // ease-out cubic
+                tw.Apply(eased);
+                if (t >= 1f) tweens.RemoveAt(i);
+            }
+            if (tweens.Count == 0) tweenTimer.Stop();
         }
 
         // Single entry point for tab changes (nav bar and in-page shortcut buttons).
@@ -348,20 +406,10 @@ namespace FitTrack
 
         private Bitmap TakeSnapshot()
         {
-            Bitmap bmp = new Bitmap(mainContent.Width, mainContent.Height);
+            // Premultiplied ARGB is the fastest format for GDI+ to draw, so each frame is cheaper.
+            Bitmap bmp = new Bitmap(mainContent.Width, mainContent.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
             mainContent.DrawToBitmap(bmp, mainContent.ClientRectangle);
             return bmp;
-        }
-
-        private PictureBox MakeSnapshotBox(Bitmap bmp)
-        {
-            PictureBox box = new PictureBox();
-            box.Image = bmp;
-            box.SizeMode = PictureBoxSizeMode.StretchImage;
-            box.BackColor = aquaBg;
-            box.Size = mainContent.ClientSize;
-            box.Location = new Point(0, 0);
-            return box;
         }
 
         private void SlideTo(Action showPage, int direction)
@@ -373,19 +421,21 @@ namespace FitTrack
             }
 
             Bitmap oldBmp = TakeSnapshot();       // current page
-            showPage();                           // build the new page (live, underneath)
+            buildingForSlide = true;
+            try { showPage(); } finally { buildingForSlide = false; }   // build the new page (live, underneath)
             mainContent.PerformLayout();
             Bitmap newBmp = TakeSnapshot();       // new page
 
             slideDirection = direction;
-            oldPageSnapshot = MakeSnapshotBox(oldBmp);
-            newPageSnapshot = MakeSnapshotBox(newBmp);
-            newPageSnapshot.Left = direction * mainContent.Width;
-
-            mainContent.Controls.Add(newPageSnapshot);
-            mainContent.Controls.Add(oldPageSnapshot);
-            newPageSnapshot.BringToFront();
-            oldPageSnapshot.BringToFront();
+            slideView = new SlideView();
+            slideView.Old = oldBmp;
+            slideView.New = newBmp;
+            slideView.Direction = direction;
+            slideView.Progress = 0f;
+            slideView.Location = new Point(0, 0);
+            slideView.Size = mainContent.ClientSize;
+            mainContent.Controls.Add(slideView);
+            slideView.BringToFront();
 
             isAnimating = true;
             clock.Restart();
@@ -394,15 +444,14 @@ namespace FitTrack
 
         private void PageTimer_Tick(object sender, EventArgs e)
         {
-            if (!isAnimating) { pageTimer.Stop(); return; }
+            if (!isAnimating || slideView == null) { pageTimer.Stop(); return; }
 
             float t = Math.Min(1f, clock.ElapsedMilliseconds / (float)AnimationMs);
             float eased = 1f - (float)Math.Pow(1f - t, 3);   // ease-out
-            int w = mainContent.Width;
-            int offset = (int)(w * eased);
 
-            oldPageSnapshot.Left = -slideDirection * offset;
-            newPageSnapshot.Left = slideDirection * (w - offset);
+            slideView.Progress = eased;     // one repaint per tick, no child controls are moved
+            slideView.Invalidate();
+            slideView.Update();
 
             if (t >= 1f) FinishAnimation();
         }
@@ -413,20 +462,14 @@ namespace FitTrack
             if (!isAnimating) return;
             isAnimating = false;
 
-            DisposeSnapshot(ref oldPageSnapshot);
-            DisposeSnapshot(ref newPageSnapshot);
+            if (slideView != null)
+            {
+                mainContent.Controls.Remove(slideView);
+                slideView.Dispose();        // also disposes both bitmaps
+                slideView = null;
+            }
             mainContent.Invalidate(true);
-        }
-
-        private void DisposeSnapshot(ref PictureBox box)
-        {
-            if (box == null) return;
-            mainContent.Controls.Remove(box);
-            Image img = box.Image;
-            box.Image = null;
-            box.Dispose();
-            if (img != null) img.Dispose();
-            box = null;
+            StartPageAnimations();          // the new page is now visible: play its entrance
         }
 
         private Panel MakeCard(int x, int y, int width, int height)
@@ -494,8 +537,145 @@ namespace FitTrack
         {
             Panel card = MakeCard(x, y, width, 84);
             card.Controls.Add(MakeLabel(heading, 13, 12, width - 20, 16, 7, true, muted));
-            card.Controls.Add(MakeLabel(value, 12, 30, width - 20, 32, 16, true, dark));
+            Label valueLabel = MakeLabel(value, 12, 30, width - 20, 32, 16, true, dark);
+            card.Controls.Add(valueLabel);
+            int number;
+            if (int.TryParse(value.Replace(",", ""), out number))
+            {
+                string fmt = value.Contains(",") ? "N0" : "0";
+                AddTween(x * 150 / CW, 800, v => valueLabel.Text = ((int)Math.Round(number * v)).ToString(fmt));
+            }
             card.Controls.Add(MakeLabel(foot, 13, 62, width - 20, 16, 7, false, muted));
+        }
+
+        // ---------------------------------------------------------------
+        // ACHIEVEMENTS
+        // ---------------------------------------------------------------
+
+        // Re-checks every rule. When announce is true, a popup is shown for each newly unlocked badge.
+        private void RefreshAchievements(bool announce)
+        {
+            List<WorkoutRecord> records = workouts
+                .Select(w => new WorkoutRecord(w.Date, w.Duration, w.Calories)).ToList();
+            List<Achievement> unlocked = _achievements.CheckAchievements(records, dailyGoal);
+
+            if (!announce) return;
+            foreach (Achievement a in unlocked)
+                MessageBox.Show(a.Icon + "  " + a.Title + "\n" + a.Description, "Achievement unlocked!");
+        }
+
+        // Compact achievements strip for the Home page. Click anywhere on it to open the full list.
+        private void AddAchievementsStrip(int y)
+        {
+            IReadOnlyList<Achievement> all = _achievements.All;
+            Panel card = MakeCard(0, y, CW, 78);
+            card.Cursor = Cursors.Hand;
+            card.Click += delegate { ShowAchievementsDialog(); };
+
+            Label title = MakeLabel("Achievements", 18, 8, 200, 22, 10, true, dark);
+            title.Cursor = Cursors.Hand;
+            title.Click += delegate { ShowAchievementsDialog(); };
+            card.Controls.Add(title);
+
+            Label count = MakeRightLabel(_achievements.UnlockedCount + " / " + all.Count + "  ›", CW - 118, 10, 100, 20, 8, true, accent);
+            count.Cursor = Cursors.Hand;
+            count.Click += delegate { ShowAchievementsDialog(); };
+            card.Controls.Add(count);
+
+            int cols = 6, gap = 6;
+            int bw = (CW - 32 - gap * (cols - 1)) / cols;
+            for (int i = 0; i < all.Count && i < cols; i++)
+            {
+                Achievement a = all[i];
+                ModernCard badge = new ModernCard();
+                badge.Radius = 12;
+                badge.Size = new Size(bw, 36);
+                badge.Location = new Point(16 + i * (bw + gap), 34);
+                badge.BackColor = a.IsUnlocked ? badgeColor : rowColor;
+                badge.TintAlpha = a.IsUnlocked ? 200 : 70;
+                badge.Cursor = Cursors.Hand;
+                badge.Click += delegate { ShowAchievementsDialog(); };
+
+                Label icon = MakeLabel(a.IsUnlocked ? a.Icon : "🔒", 0, 0, bw, 36, 11, false, dark);
+                icon.Font = new Font("Segoe UI Emoji", 12F);
+                icon.TextAlign = ContentAlignment.MiddleCenter;
+                icon.Cursor = Cursors.Hand;
+                icon.Click += delegate { ShowAchievementsDialog(); };
+                badge.Controls.Add(icon);
+
+                string tip = a.Title + "\n" + a.Description +
+                    (a.IsUnlocked ? "\nUnlocked " + a.UnlockedOn.Value.ToString("MMM d, yyyy") : "\nLocked");
+                achTip.SetToolTip(badge, tip);
+                achTip.SetToolTip(icon, tip);
+                card.Controls.Add(badge);
+            }
+        }
+
+        // Popup that lists every achievement with its description and unlock date.
+        private void ShowAchievementsDialog()
+        {
+            IReadOnlyList<Achievement> all = _achievements.All;
+
+            Form dialog = new Form();
+            dialog.Text = "Achievements";
+            dialog.Size = new Size(390, 520);
+            dialog.StartPosition = FormStartPosition.CenterParent;
+            dialog.FormBorderStyle = FormBorderStyle.None;
+            dialog.ShowInTaskbar = false;
+            dialog.BackColor = aquaBg;
+            typeof(Control).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(dialog, true, null);
+            dialog.Region = new Region(Gfx.RoundRect(new Rectangle(0, 0, dialog.Width, dialog.Height), 28));
+            dialog.MouseDown += DragWindow;
+            dialog.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawImage(Backdrop.Get(dialog.ClientSize), 0, 0);
+            };
+
+            dialog.Controls.Add(MakeLabel("Achievements", 25, 20, 240, 30, 14, true, dark));
+            dialog.Controls.Add(MakeRightLabel(_achievements.UnlockedCount + " of " + all.Count + " unlocked", 190, 26, 175, 22, 8, true, accent));
+
+            ScrollPanel list = new ScrollPanel();
+            list.Location = new Point(16, 64);
+            list.Size = new Size(358, 380);
+            list.BackColor = aquaBg;
+
+            int rowW = list.Width - 8;
+            if (all.Count * 58 > list.Height) rowW -= SystemInformation.VerticalScrollBarWidth;
+
+            int y = 0;
+            foreach (Achievement a in all)
+            {
+                ModernCard row = new ModernCard();
+                row.Radius = 14;
+                row.Location = new Point(4, y);
+                row.Size = new Size(rowW, 52);
+                row.BackColor = a.IsUnlocked ? badgeColor : rowColor;
+                row.TintAlpha = a.IsUnlocked ? 200 : 70;
+
+                Label icon = MakeLabel(a.IsUnlocked ? a.Icon : "🔒", 0, 0, 52, 52, 12, false, dark);
+                icon.Font = new Font("Segoe UI Emoji", 15F);
+                icon.TextAlign = ContentAlignment.MiddleCenter;
+                row.Controls.Add(icon);
+
+                Label name = MakeLabel(a.Title, 54, 6, rowW - 54 - 100, 20, 9, true, a.IsUnlocked ? dark : muted);
+                name.AutoEllipsis = true;
+                row.Controls.Add(name);
+                Label desc = MakeLabel(a.Description, 54, 28, rowW - 54 - 10, 18, 7, false, muted);
+                desc.AutoEllipsis = true;
+                row.Controls.Add(desc);
+
+                Label status = MakeRightLabel(a.IsUnlocked ? a.UnlockedOn.Value.ToString("MMM d, yyyy") : "Locked",
+                    rowW - 106, 6, 96, 20, 7, true, a.IsUnlocked ? accent : muted);
+                row.Controls.Add(status);
+                status.BringToFront();
+
+                list.Controls.Add(row);
+                y += 58;
+            }
+            dialog.Controls.Add(list);
+
+            dialog.Controls.Add(MakeButton("Close", 25, 458, 340, 42, delegate { dialog.Close(); }, true));
+            dialog.ShowDialog(this);
         }
 
         private void ShowDashboard()
@@ -517,14 +697,18 @@ namespace FitTrack
             hero.BackColor = ColorTranslator.FromHtml("#123D3A");
             ((ModernCard)hero).TintAlpha = 190;
             hero.Controls.Add(MakeLabel("DAILY MOVEMENT GOAL", 20, 16, 240, 18, 7, true, mint));
-            hero.Controls.Add(MakeLabel(todayMinutes + " / " + dailyGoal + " min", 20, 36, 280, 36, 20, true, Color.White));
-            hero.Controls.Add(MakeLabel(goalPercent + "% completed today", 20, 74, 240, 18, 8, false, ColorTranslator.FromHtml("#D8FFF6")));
+            Label heroValue = MakeLabel(todayMinutes + " / " + dailyGoal + " min", 20, 36, 280, 36, 20, true, Color.White);
+            hero.Controls.Add(heroValue);
+            AddTween(0, 800, v => heroValue.Text = (int)Math.Round(todayMinutes * v) + " / " + dailyGoal + " min");
+            Label heroPercent = MakeLabel(goalPercent + "% completed today", 20, 74, 240, 18, 8, false, ColorTranslator.FromHtml("#D8FFF6"));
+            hero.Controls.Add(heroPercent);
+            AddTween(0, 800, v => heroPercent.Text = (int)Math.Round(goalPercent * v) + "% completed today");
             SoftProgress progress = new SoftProgress();
             progress.Track = ColorTranslator.FromHtml("#245A55");
             progress.Fill = mint;
             progress.Location = new Point(20, 98);
             progress.Size = new Size(CW - 40, 10);
-            progress.Value = goalPercent;
+            AnimateProgress(progress, goalPercent, 100);
             hero.Controls.Add(progress);
             hero.Controls.Add(MakeButton("Goals", CW - 92, 22, 72, 30, delegate { GoToPage(3); }, true));
 
@@ -535,7 +719,7 @@ namespace FitTrack
             AddStat("CALORIES", calories.ToString("N0"), "kcal", 2 * (sw + 8), 130, sw);
             AddStat("AVERAGE", average.ToString(), "min each", 3 * (sw + 8), 130, sw);
 
-            Panel chartCard = MakeCard(0, 224, CW, 185);
+            Panel chartCard = MakeCard(0, 224, CW, 160);
             chartCard.Controls.Add(MakeLabel("Activity this week", 18, 12, 240, 24, 11, true, dark));
             chartCard.Controls.Add(MakeLabel("Workout minutes by day", 18, 34, 240, 16, 7, false, muted));
             MiniBarChart chart = new MiniBarChart();
@@ -545,13 +729,17 @@ namespace FitTrack
             chart.Labels = Enumerable.Range(0, 7).Select(o => weekStart.AddDays(o).ToString("ddd").Substring(0, 1)).ToArray();
             chart.Accent = teal;
             chart.LabelColor = muted;
+            AddTween(250, 800, v => chart.Grow = v);
             chartCard.Controls.Add(chart);
 
-            int recentCount = Math.Min(3, workouts.Count);
-            Panel recent = MakeCard(0, 419, CW, recentCount == 0 ? 110 : 44 + recentCount * 54 + 6);
+            int recentCount = Math.Min(2, workouts.Count);
+            Panel recent = MakeCard(0, 394, CW, recentCount == 0 ? 110 : 44 + recentCount * 54 + 6);
             recent.Controls.Add(MakeLabel("Recent workouts", 18, 12, 220, 24, 11, true, dark));
             recent.Controls.Add(MakeButton("See all", CW - 84, 10, 66, 28, delegate { GoToPage(2); }, false));
-            AddWorkoutRows(recent, 44, 3);
+            AddWorkoutRows(recent, 44, 2);
+
+            // Achievements live on the Home page only.
+            AddAchievementsStrip(562);
         }
 
         private void ShowWorkouts()
@@ -633,7 +821,10 @@ namespace FitTrack
             dialog.Controls.Add(save);
 
             if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                RefreshAchievements(true);
                 ShowWorkouts();
+            }
         }
 
         // Adds compact workout rows. Rows are 48px tall with a 6px gap.
@@ -869,7 +1060,7 @@ namespace FitTrack
             bar.Location = new Point(20, y + 30);
             bar.Size = new Size(panel.Width - 40, 10);
             bar.Track = trackColor;
-            bar.Value = Math.Min(100, percent);
+            AnimateProgress(bar, Math.Min(100, percent), y * 2);
             panel.Controls.Add(bar);
         }
 
@@ -896,6 +1087,7 @@ namespace FitTrack
             chart.Labels = Enumerable.Range(0, 7).Select(o => weekStart.AddDays(o).ToString("ddd")).ToArray();
             chart.Accent = teal;
             chart.LabelColor = muted;
+            AddTween(250, 800, v => chart.Grow = v);
             p.Controls.Add(chart);
 
             Workout longest = workouts.OrderByDescending(x => x.Duration).FirstOrDefault();
@@ -958,6 +1150,7 @@ namespace FitTrack
                 profileName = newName.Length == 0 ? "Fitness User" : newName;
                 fitnessLevel = level.Text;
                 dailyGoal = ReadNumber(goalInput);
+                RefreshAchievements(true);
                 showSavedNotice = true;
                 ShowSettings();
             }, true));
@@ -1049,6 +1242,7 @@ namespace FitTrack
                     Workout logged = new Workout(done.Name, done.Category, done.Duration, done.Calories, DateTime.Now);
                     workouts.Insert(0, logged);
                     undoStack.Push(logged);
+                    RefreshAchievements(true);
                     Workout upcoming = planQueue.Peek();
                     queueStatus = "'" + done.Name + "' completed and saved to History. " + (upcoming == null ? "Your queue is now empty." : "Next: " + upcoming.Name + ".");
                 }
@@ -1119,6 +1313,44 @@ namespace FitTrack
             }
             if (waiting == 0)
                 scroller.Controls.Add(MakeLabel("Nothing else is lined up. Plan another workout above!", 16, 8, 340, 24, 9, false, muted));
+        }
+    }
+
+    // Paints the old and new page snapshots side by side in a single, flicker-free, double-buffered draw.
+    public class SlideView : Control
+    {
+        public Bitmap Old;
+        public Bitmap New;
+        public float Progress;      // 0 = old page fully visible, 1 = new page fully visible
+        public int Direction = 1;   // 1 = new page enters from the right, -1 = from the left
+
+        public SlideView()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque, true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e) { }   // every pixel is drawn in OnPaint
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            if (Old == null || New == null) return;
+            Graphics g = e.Graphics;
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            int offset = (int)(Width * Progress);
+            g.DrawImageUnscaled(Old, -Direction * offset, 0);
+            g.DrawImageUnscaled(New, Direction * (Width - offset), 0);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (Old != null) { Old.Dispose(); Old = null; }
+                if (New != null) { New.Dispose(); New = null; }
+            }
+            base.Dispose(disposing);
         }
     }
 
@@ -1381,6 +1613,8 @@ namespace FitTrack
 
         private int selected;
         private int hover = -1;
+        private float pillPos = -1f;                       // animated position of the active pill, in tab units
+        private System.Windows.Forms.Timer glideTimer;
 
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -1392,6 +1626,7 @@ namespace FitTrack
                 if (selected != value)
                 {
                     selected = value;
+                    if (glideTimer != null) glideTimer.Start();
                     Invalidate();
                 }
             }
@@ -1402,6 +1637,21 @@ namespace FitTrack
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Cursor = Cursors.Hand;
             Height = 70;
+            glideTimer = new System.Windows.Forms.Timer();
+            glideTimer.Interval = 15;
+            glideTimer.Tick += delegate
+            {
+                if (pillPos < 0f) pillPos = selected;
+                pillPos += (selected - pillPos) * 0.28f;
+                if (Math.Abs(selected - pillPos) < 0.01f) { pillPos = selected; glideTimer.Stop(); }
+                Invalidate();
+            };
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && glideTimer != null) { glideTimer.Dispose(); glideTimer = null; }
+            base.Dispose(disposing);
         }
 
         private int IndexAt(int x)
@@ -1459,13 +1709,21 @@ namespace FitTrack
             {
                 format.Alignment = StringAlignment.Center;
                 format.LineAlignment = StringAlignment.Center;
+
+                // Active pill: glides from the old tab to the new one.
+                if (pillPos < 0f) pillPos = selected;
+                Rectangle activePill = new Rectangle((int)Math.Round(pillPos * slotWidth) + (slotWidth - 50) / 2, 8, 50, 30);
+                using (SolidBrush pillFill = new SolidBrush(PillColor))
+                using (GraphicsPath pillPath = Gfx.RoundRect(activePill, 15))
+                    g.FillPath(pillFill, pillPath);
+
                 for (int i = 0; i < count; i++)
                 {
                     bool active = i == selected;
                     Rectangle pill = new Rectangle(i * slotWidth + (slotWidth - 50) / 2, 8, 50, 30);
-                    if (active || i == hover)
+                    if (!active && i == hover)
                     {
-                        using (SolidBrush fill = new SolidBrush(active ? PillColor : HoverColor))
+                        using (SolidBrush fill = new SolidBrush(HoverColor))
                         using (GraphicsPath path = Gfx.RoundRect(pill, 15))
                             g.FillPath(fill, path);
                     }
@@ -1480,36 +1738,65 @@ namespace FitTrack
         }
     }
 
-    // Flat pill button with no border.
+    // Flat pill button with no border. Fades smoothly on hover and sinks slightly when pressed.
     public class RoundButton : Control
     {
         public Color Fill = Color.MediumTurquoise;
         public Color HoverFill = Color.Turquoise;
         private bool hover;
+        private bool pressed;
+        private float hoverT;
+        private System.Windows.Forms.Timer fadeTimer;
 
         public RoundButton()
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             Cursor = Cursors.Hand;
+            fadeTimer = new System.Windows.Forms.Timer();
+            fadeTimer.Interval = 15;
+            fadeTimer.Tick += delegate
+            {
+                float target = hover ? 1f : 0f;
+                hoverT += (target - hoverT) * 0.35f;
+                if (Math.Abs(target - hoverT) < 0.02f) { hoverT = target; fadeTimer.Stop(); }
+                Invalidate();
+            };
         }
 
-        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
-        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; fadeTimer.Start(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; pressed = false; fadeTimer.Start(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { pressed = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { pressed = false; Invalidate(); base.OnMouseUp(e); }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && fadeTimer != null) { fadeTimer.Dispose(); fadeTimer = null; }
+            base.Dispose(disposing);
+        }
+
+        private static Color Blend(Color a, Color b, float t)
+        {
+            return Color.FromArgb(
+                (int)(a.R + (b.R - a.R) * t),
+                (int)(a.G + (b.G - a.G) * t),
+                (int)(a.B + (b.B - a.B) * t));
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Backdrop.PaintBehind(this, e.Graphics);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-            using (SolidBrush brush = new SolidBrush(hover ? HoverFill : Fill))
-            using (GraphicsPath path = Gfx.RoundRect(new Rectangle(0, 0, Width, Height), Height / 2))
+            Rectangle body = pressed ? new Rectangle(2, 1, Width - 4, Height - 2) : new Rectangle(0, 0, Width, Height);
+            using (SolidBrush brush = new SolidBrush(Blend(Fill, HoverFill, hoverT)))
+            using (GraphicsPath path = Gfx.RoundRect(body, body.Height / 2))
                 e.Graphics.FillPath(brush, path);
             using (SolidBrush text = new SolidBrush(ForeColor))
             using (StringFormat format = new StringFormat())
             {
                 format.Alignment = StringAlignment.Center;
                 format.LineAlignment = StringAlignment.Center;
-                e.Graphics.DrawString(Text, Font, text, new RectangleF(0, 0, Width, Height), format);
+                e.Graphics.DrawString(Text, Font, text, new RectangleF(body.X, body.Y, body.Width, body.Height), format);
             }
         }
     }
@@ -1576,6 +1863,15 @@ namespace FitTrack
         public Color Accent = Color.MediumTurquoise;
         public Color LabelColor = Color.FromArgb(74, 102, 100);
 
+        private float grow = 1f;          // 0 = bars flat, 1 = full height
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public float Grow
+        {
+            get { return grow; }
+            set { grow = Math.Max(0f, Math.Min(1f, value)); Invalidate(); }
+        }
+
         public MiniBarChart()
         {
             DoubleBuffered = true;
@@ -1607,7 +1903,8 @@ namespace FitTrack
                 for (int i = 0; i < Values.Length; i++)
                 {
                     int barWidth = Math.Min(36, Math.Max(14, slot / 2));
-                    int barHeight = (int)((bottom - 30) * Values[i] / (double)max);
+                    float barGrow = Math.Max(0f, Math.Min(1f, grow * 1.5f - i * 0.08f));   // each bar starts a little later
+                    int barHeight = (int)((bottom - 30) * Values[i] / (double)max * barGrow);
                     int x = i * slot + (slot - barWidth) / 2;
                     int y = bottom - barHeight;
                     if (barHeight > 0)
