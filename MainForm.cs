@@ -54,12 +54,16 @@ namespace FitTrack
         private int dailyGoal = 45;
         private bool showSavedNotice;
 
+        private Challenge challenge = new Challenge();
+        private List<string> bracketLines = new List<string>();
+        private string challengeMessage = "Add at least 2 friends, then start the challenge.";
+
         // QUEUE (real-life use: your "Up next" playlist of planned workouts, first in = first done)
         private LinkedQueue<Workout> planQueue = new LinkedQueue<Workout>();
         private string queueStatus = "Add workouts to the back of the line. You always do the front one first.";
 
         private NavBar navBar;
-        private string[] navKeys = new string[] { "Dashboard", "My Workouts", "Workout History", "Fitness Goals", "Progress", "Settings", "Workout Queue" };
+        private string[] navKeys = new string[] { "Dashboard", "My Workouts", "Workout History", "Fitness Goals", "Progress", "Settings" };
 
         [DllImport("user32.dll")] private static extern bool ReleaseCapture();
         [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
@@ -326,10 +330,15 @@ namespace FitTrack
             navBar = new NavBar();
             navBar.Dock = DockStyle.Bottom;
             navBar.Height = 70;
-            navBar.Names = new string[] { "Home", "Train", "History", "Goals", "Stats", "Settings", "Queue" };
-            navBar.Icons = new string[] { "⌂", "♥", "↺", "◎", "◔", "⚙", "≡" };
-            pages = new Action[] { ShowDashboard, ShowWorkouts, ShowHistory, ShowGoals, ShowProgress, ShowSettings, ShowQueue };
-            navBar.ItemClicked += delegate(int index) { GoToPage(index); };
+            navBar.Names = new string[] { "Home", "Train", "History", "Goals", "Stats", "Settings" };
+            navBar.Icons = new string[] { "⌂", "♥", "↺", "◎", "◔", "⚙" };
+            Action[] pages = new Action[] { ShowDashboard, ShowWorkouts, ShowHistory, ShowGoals, ShowProgress, ShowSettings };
+            navBar.ItemClicked += delegate(int index)
+            {
+                navBar.Selected = index;
+                pages[index]();
+            };
+            this.Controls.Add(navBar);
         }
 
         private void SetActiveNavigation(string selected)
@@ -1102,6 +1111,94 @@ namespace FitTrack
         {
             panel.Controls.Add(MakeLabel(caption, 18, y, 130, 20, 8, false, muted));
             panel.Controls.Add(MakeRightLabel(value, 140, y, panel.Width - 140 - 18, 20, 8, true, dark));
+        }
+
+        private void ShowChallenge()
+        {
+            PreparePage("Friends Challenge", "Add friends and see who wins the bracket.");
+            SetActiveNavigation("Friends Challenge");
+
+            // --- Add player card ---
+            Panel form = MakeCard(0, 0, CW, 190);
+            form.Controls.Add(MakeLabel("Add a player", 18, 12, 250, 24, 12, true, dark));
+            form.Controls.Add(MakeLabel("Name", 18, 40, 150, 16, 7, true, muted));
+            form.Controls.Add(MakeLabel("Score (e.g. weekly minutes)", 234, 40, 150, 16, 7, true, muted));
+
+            TextBox name = new TextBox();
+            NumericUpDown score = new NumericUpDown();
+            score.Minimum = 0;
+            score.Maximum = 1000000;
+            form.Controls.Add(MakeInput(name, 16, 58, 210));
+            form.Controls.Add(MakeInput(score, 234, 58, 150));
+
+            form.Controls.Add(MakeButton("Add player", 16, 106, 120, 34, delegate
+            {
+                string n = name.Text.Trim();
+                if (n.Length == 0)
+                    challengeMessage = "Enter a name first.";
+                else if (!challenge.AddPlayer(n, (int)score.Value))
+                    challengeMessage = n + " already joined.";
+                else
+                {
+                    challengeMessage = n + " added.";
+                    bracketLines.Clear();
+                }
+                ShowChallenge();
+            }, true));
+
+            form.Controls.Add(MakeButton("Start challenge", 144, 106, 150, 34, delegate
+            {
+                if (!challenge.Build())
+                    challengeMessage = "You need at least 2 players.";
+                else
+                {
+                    bracketLines = challenge.DescribeBracket();
+                    challengeMessage = "Champion: " + challenge.Champion;
+                }
+                ShowChallenge();
+            }, true));
+
+            form.Controls.Add(MakeButton("Reset", 302, 106, 82, 34, delegate
+            {
+                challenge.Reset();
+                bracketLines.Clear();
+                challengeMessage = "Challenge reset.";
+                ShowChallenge();
+            }, false));
+
+            form.Controls.Add(MakeLabel(challengeMessage, 18, 150, CW - 36, 30, 8, true, ColorTranslator.FromHtml("#078F78")));
+
+            // --- Players card ---
+            Panel playersCard = MakeCard(0, 200, CW, 150);
+            playersCard.Controls.Add(MakeLabel("Players (" + challenge.Players.Count + ")", 18, 12, 250, 24, 12, true, dark));
+            ScrollPanel playerList = MakeScroller(playersCard, 44);
+            int py = 4;
+            foreach (MatchNode p in challenge.Players)
+            {
+                playerList.Controls.Add(MakeLabel(p.Name, 14, py, 220, 22, 9, true, dark));
+                playerList.Controls.Add(MakeRightLabel(p.Score.ToString("N0"), 236, py, 120, 22, 9, false, muted));
+                py += 26;
+            }
+            if (challenge.Players.Count == 0)
+                playerList.Controls.Add(MakeLabel("No players yet.", 14, 4, 300, 22, 9, false, muted));
+
+            // --- Bracket card ---
+            Panel bracketCard = MakeCard(0, 360, CW, 280);
+            bracketCard.Controls.Add(MakeLabel("Bracket", 18, 12, 250, 24, 12, true, dark));
+            ScrollPanel bracketList = MakeScroller(bracketCard, 44);
+            int by = 4;
+            foreach (string line in bracketLines)
+            {
+                if (line.Length == 0) { by += 8; continue; }
+                bool header = line.StartsWith("===");
+                bool champ = line.StartsWith("CHAMPION");
+                Label l = MakeLabel(line, 14, by, 350, 20, header || champ ? 9 : 8, header || champ, header ? teal : dark);
+                l.AutoEllipsis = true;
+                bracketList.Controls.Add(l);
+                by += 22;
+            }
+            if (bracketLines.Count == 0)
+                bracketList.Controls.Add(MakeLabel("Press Start challenge to see the matches.", 14, 4, 350, 22, 9, false, muted));
         }
 
         private void ShowSettings()
